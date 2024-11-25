@@ -17,6 +17,7 @@ import (
 type Sender struct {
 	dataCh  chan *Data
 	counter atomic.Int64
+	ops     int
 
 	clients  []*client
 	pipeline int
@@ -26,7 +27,7 @@ type client struct {
 	rdb *redis.Client
 }
 
-func NewSender(clientNum int, addr, password string, pipeline int, dataCh chan *Data) *Sender {
+func NewSender(clientNum int, addr, password string, pipeline, ops int, dataCh chan *Data) *Sender {
 	clients := make([]*client, 0, clientNum)
 	for i := 0; i < clientNum; i++ {
 		c := &client{
@@ -40,6 +41,7 @@ func NewSender(clientNum int, addr, password string, pipeline int, dataCh chan *
 
 	return &Sender{
 		dataCh:   dataCh,
+		ops:      ops,
 		clients:  clients,
 		pipeline: pipeline,
 	}
@@ -60,7 +62,7 @@ func (s *Sender) Run(ctx context.Context) {
 		}
 	}()
 
-	limiter := rate.NewLimiter(100, 100)
+	limiter := rate.NewLimiter(rate.Limit(s.ops), ops)
 
 	batchData := make([]*Data, 0, s.pipeline)
 
