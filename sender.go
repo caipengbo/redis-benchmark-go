@@ -62,7 +62,7 @@ func (s *Sender) Run(ctx context.Context) {
 		}
 	}()
 
-	limiter := rate.NewLimiter(rate.Limit(s.ops), ops)
+	limiter := rate.NewLimiter(rate.Limit(s.ops), s.ops/2)
 
 	batchData := make([]*Data, 0, s.pipeline)
 
@@ -77,13 +77,7 @@ func (s *Sender) Run(ctx context.Context) {
 				return
 			}
 
-			// Rate limit
-			if !limiter.Allow() && len(batchData) > 0 {
-				// Send last pending data
-				pendingSendCh <- batchData
-				batchData = make([]*Data, 0, s.pipeline)
-			}
-
+			// rate limit
 			if err := limiter.Wait(ctx); err != nil {
 				continue
 			}

@@ -17,6 +17,7 @@ var (
 	versionFlag bool
 	address     string
 	password    string
+	clientsNum  int
 	duration    string
 	dataTypes   []string
 	pipeline    int
@@ -81,7 +82,7 @@ func run() {
 
 	dataCh := RunDataGenerators(ctx, dataGenerators...)
 
-	sender := NewSender(3, address, password, pipeline, ops, dataCh)
+	sender := NewSender(clientsNum, address, password, pipeline, ops, dataCh)
 	sender.Run(ctx)
 }
 
@@ -90,6 +91,7 @@ func main() {
 	rootCmd.Flags().BoolVarP(&versionFlag, "version", "v", false, "print the version info")
 	rootCmd.Flags().StringVarP(&address, "address", "a", "", "the address of redis server")
 	rootCmd.Flags().StringVarP(&password, "password", "p", "", "the password of redis server")
+	rootCmd.Flags().IntVarP(&clientsNum, "client", "c", 8, "the number of clients")
 	rootCmd.Flags().StringVarP(&duration, "duration", "d", "24h", "the duration of running(unit: s, m, h), must >= 1s")
 	rootCmd.Flags().StringSliceVarP(&dataTypes, "types", "t", []string{"string"},
 		"data type(use commas to separate multiple), support string, list, set, hash, zset")
