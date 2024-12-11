@@ -23,6 +23,7 @@ var (
 	pipeline    int
 	fieldsNum   int
 	ops         int
+	keyPrefix   string
 
 	rootCmd = &cobra.Command{
 		Use:   "redis-benchmark-go",
@@ -76,7 +77,7 @@ func run() {
 		if len(t) == 0 {
 			continue
 		}
-		generator := NewDataGenerator(Type(strings.ToLower(t)), fieldsNum, 10)
+		generator := NewDataGenerator(Type(strings.ToLower(t)), keyPrefix, fieldsNum, 10)
 		dataGenerators = append(dataGenerators, generator)
 	}
 
@@ -98,6 +99,7 @@ func main() {
 	rootCmd.Flags().IntVar(&pipeline, "pipeline", 16, "the pipeline of redis client")
 	rootCmd.Flags().IntVar(&fieldsNum, "fields", 8, "the fields number of hash, zset, set, list data")
 	rootCmd.Flags().IntVar(&ops, "ops", 10000, "the sending speed(command per second)")
+	rootCmd.Flags().StringVar(&keyPrefix, "key-prefix", "", "prefix for keys")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

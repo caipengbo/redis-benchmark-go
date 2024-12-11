@@ -26,6 +26,7 @@ type Data struct {
 
 type DataGenerator struct {
 	t         Type
+	keyPrefix string
 	fieldNum  int
 	valueSize int
 }
@@ -41,9 +42,10 @@ func IsSupportedType(t string) bool {
 	}
 }
 
-func NewDataGenerator(t Type, fieldNum, valueSize int) *DataGenerator {
+func NewDataGenerator(t Type, keyPrefix string, fieldNum, valueSize int) *DataGenerator {
 	return &DataGenerator{
 		t:         t,
+		keyPrefix: keyPrefix,
 		fieldNum:  fieldNum,
 		valueSize: valueSize,
 	}
@@ -118,7 +120,7 @@ func (g *DataGenerator) nextData() *Data {
 
 func (g *DataGenerator) nextKey() string {
 	// TODO: 按照指定分布生成key
-	return fmt.Sprintf("%s_key_%d", g.t, keyIndex.Load())
+	return fmt.Sprintf("%s%s_key_%d", g.keyPrefix, g.t, keyIndex.Load())
 }
 
 func (g *DataGenerator) nextValue() string {
