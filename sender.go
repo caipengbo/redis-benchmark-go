@@ -496,34 +496,52 @@ func addToPipeline(ctx context.Context, pipe redis.Pipeliner, t Type, ops []*Ope
 		case String:
 			pipe.Set(ctx, op.key, op.strVal, op.ttl)
 		case Hash:
-			m := op.typedVal.(map[string]string)
-			kvs := make([]interface{}, 0, len(m)*2)
-			for k, v := range m {
-				kvs = append(kvs, k, v)
-			}
-			pipe.HSet(ctx, op.key, kvs...)
-		case List, Set:
-			vals := op.typedVal.([]string)
-			args := make([]interface{}, len(vals))
-			for i, v := range vals {
-				args[i] = v
-			}
-			if t == List {
-				pipe.LPush(ctx, op.key, args...)
-			} else {
-				pipe.SAdd(ctx, op.key, args...)
-			}
+			// typedVal is a pre-built, read-only []interface{} of alternating
+			// field/value pairs, shared across every write (go-redis only reads
+			// the args), so there is no per-op allocation here.
+			pipe.HSet(ctx, op.key, op.typedVal.([]interface{})...)
+		case List:
+			pipe.LPush(ctx, op.key, op.typedVal.([]interface{})...)
+		case Set:
+			pipe.SAdd(ctx, op.key, op.typedVal.([]interface{})...)
 		case ZSet:
-			m := op.typedVal.(map[string]float64)
-			members := make([]redis.Z, 0, len(m))
-			for member, score := range m {
-				members = append(members, redis.Z{Score: score, Member: member})
-			}
-			pipe.ZAdd(ctx, op.key, members...)
+			pipe.ZAdd(ctx, op.key, op.typedVal.([]redis.Z)...)
 		}
 
 		if op.ttl > 0 && t != String {
 			pipe.Expire(ctx, op.key, op.ttl)
 		}
+	}
+}
+
+// typedPipelineArgs converts a type's constant payload into the exact argument
+// form its pipeline command expects. It is computed once per workload and
+// shared read-only across every write, keeping the non-string write path
+// allocation-free.
+func typedPipelineArgs(t Type, v any) any {
+	switch t {
+	case Hash:
+		m := v.(map[string]string)
+		kvs := make([]interface{}, 0, len(m)*2)
+		for k, val := range m {
+			kvs = append(kvs, k, val)
+		}
+		return kvs
+	case List, Set:
+		vals := v.([]string)
+		args := make([]interface{}, len(vals))
+		for i, val := range vals {
+			args[i] = val
+		}
+		return args
+	case ZSet:
+		m := v.(map[string]float64)
+		members := make([]redis.Z, 0, len(m))
+		for member, score := range m {
+			members = append(members, redis.Z{Score: score, Member: member})
+		}
+		return members
+	default:
+		return nil
 	}
 }

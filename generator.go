@@ -1,8 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
-	"hash/fnv"
 	"math"
 	"math/rand"
 	"sync"
@@ -17,31 +15,28 @@ import (
 // Generator generates a sequence of int64 values following some distribution.
 type Generator interface {
 	Next(r *rand.Rand) int64
-	Last() int64
 }
 
-// hash64 returns a positive FNV-1a hash of the big-endian int64.
+// hash64 returns a positive FNV-1a hash of the big-endian int64. It is inlined
+// (no hash.Hash64 allocation) because it runs once per generated key on the
+// scrambled-zipfian hot path.
 func hash64(n int64) int64 {
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[0:8], uint64(n))
-	h := fnv.New64a()
-	_, _ = h.Write(b[0:8])
-	result := int64(h.Sum64())
+	const (
+		offset64 = uint64(1469598103934665603)
+		prime64  = uint64(1099511628211)
+	)
+	u := uint64(n)
+	h := offset64
+	for shift := 56; shift >= 0; shift -= 8 {
+		h ^= (u >> uint(shift)) & 0xff
+		h *= prime64
+	}
+	result := int64(h)
 	if result < 0 {
 		return -result
 	}
 	return result
 }
-
-// number is the common base holding the last generated value. lastValue is
-// accessed atomically because a single generator instance is shared across all
-// workers (each passing its own *rand.Rand).
-type number struct {
-	lastValue int64
-}
-
-func (n *number) setLastValue(v int64) { atomic.StoreInt64(&n.lastValue, v) }
-func (n *number) Last() int64          { return atomic.LoadInt64(&n.lastValue) }
 
 // Counter generates a monotonically increasing sequence [start, start+1, ...].
 type Counter struct {
@@ -51,9 +46,10 @@ type Counter struct {
 func NewCounter(start int64) *Counter { return &Counter{counter: start} }
 
 func (c *Counter) Next(_ *rand.Rand) int64 { return atomic.AddInt64(&c.counter, 1) - 1 }
-func (c *Counter) Last() int64             { return atomic.LoadInt64(&c.counter) - 1 }
 
-// Sequential cycles through [start, start+interval) repeatedly.
+// Sequential cycles through [start, start+interval) repeatedly. The shared
+// counter is atomic because "sequential" requires a single global order across
+// workers; this makes S less scalable than R/Z under many cores.
 type Sequential struct {
 	counter  int64
 	interval int64
@@ -67,11 +63,9 @@ func NewSequential(countStart, countEnd int64) *Sequential {
 func (s *Sequential) Next(_ *rand.Rand) int64 {
 	return s.start + atomic.AddInt64(&s.counter, 1)%s.interval
 }
-func (s *Sequential) Last() int64 { return atomic.LoadInt64(&s.counter) + 1 }
 
 // Uniform generates integers uniformly at random in [lb, ub].
 type Uniform struct {
-	number
 	lb       int64
 	interval int64
 }
@@ -81,9 +75,7 @@ func NewUniform(lb, ub int64) *Uniform {
 }
 
 func (u *Uniform) Next(r *rand.Rand) int64 {
-	n := r.Int63n(u.interval) + u.lb
-	u.setLastValue(n)
-	return n
+	return r.Int63n(u.interval) + u.lb
 }
 
 // ZipfianConstant is the default zipfian skew constant.
@@ -93,8 +85,6 @@ const ZipfianConstant = float64(0.99)
 // Algorithm from "Quickly Generating Billion-Record Synthetic Databases",
 // Jim Gray et al, SIGMOD 1994.
 type Zipfian struct {
-	number
-
 	lock sync.Mutex
 
 	items int64
@@ -171,7 +161,6 @@ func (z *Zipfian) next(r *rand.Rand, itemCount int64) int64 {
 		return z.base + 1
 	}
 	ret := z.base + int64(float64(itemCount)*math.Pow(z.eta*u-z.eta+1, z.alpha))
-	z.setLastValue(ret)
 	return ret
 }
 
@@ -180,7 +169,6 @@ func (z *Zipfian) Next(r *rand.Rand) int64 { return z.next(r, z.items) }
 // ScrambledZipfian scatters the popular items across the whole [min,max] range
 // (item popularity no longer clusters by adjacency).
 type ScrambledZipfian struct {
-	number
 	gen       *Zipfian
 	min       int64
 	itemCount int64
@@ -206,7 +194,5 @@ func NewScrambledZipfian(min, max int64, zipfianConstant float64) *ScrambledZipf
 
 func (s *ScrambledZipfian) Next(r *rand.Rand) int64 {
 	n := s.gen.Next(r)
-	n = s.min + hash64(n)%s.itemCount
-	s.setLastValue(n)
-	return n
+	return s.min + hash64(n)%s.itemCount
 }

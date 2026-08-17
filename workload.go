@@ -38,7 +38,8 @@ type Workload struct {
 	dataSizeMax int
 	randomData  bool
 
-	// non-string constant payload
+	// non-string constant payload, pre-built into the exact pipeline arg form
+	// ([]interface{} for Hash/List/Set, []redis.Z for ZSet) and shared read-only.
 	typedVal any
 
 	// TTL: a fixed value, or a random value in [ttlMin,ttlMax] when hasTTLRange.
@@ -231,7 +232,7 @@ func NewWorkload(c WorkloadConfig) *Workload {
 		hasTTLRange: c.HasTTLRange,
 	}
 	if c.Type != String {
-		w.typedVal = typedValue(c.Type, c.FieldNum)
+		w.typedVal = typedPipelineArgs(c.Type, typedValue(c.Type, c.FieldNum))
 	}
 	return w
 }

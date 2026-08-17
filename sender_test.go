@@ -302,3 +302,38 @@ func TestSenderRateLimit(t *testing.T) {
 		t.Errorf("rate-limited counter = %d too low for %v at %d ops/s", got, dur, ops)
 	}
 }
+
+// TestThrottleWait covers both branches of the reusable-timer throttle without
+// needing redis: the timer firing (returns true) and ctx cancellation
+// (returns false). It also reuses the same timer across calls to exercise the
+// Reset path.
+func TestThrottleWait(t *testing.T) {
+	tm := time.NewTimer(time.Hour)
+	tm.Stop()
+
+	// Timer fires before ctx is done -> true.
+	if !throttleWait(context.Background(), tm, time.Millisecond) {
+		t.Fatal("throttleWait returned false when the timer should have fired")
+	}
+
+	// Reusing the same timer must still work (Reset path).
+	if !throttleWait(context.Background(), tm, time.Millisecond) {
+		t.Fatal("throttleWait returned false on timer reuse")
+	}
+
+	// ctx already cancelled -> false, without waiting out the long duration.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if throttleWait(ctx, tm, time.Hour) {
+		t.Fatal("throttleWait returned true when ctx was cancelled")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("throttleWait blocked %v on a cancelled ctx, should return promptly", elapsed)
+	}
+
+	// Timer must be reusable after the cancellation branch stopped it.
+	if !throttleWait(context.Background(), tm, time.Millisecond) {
+		t.Fatal("throttleWait returned false after the cancellation branch")
+	}
+}
