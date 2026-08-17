@@ -3,9 +3,9 @@ module redis-benchmark-go
 go 1.21
 
 require (
+	github.com/HdrHistogram/hdrhistogram-go v1.1.2
 	github.com/redis/go-redis/v9 v9.7.0
 	github.com/spf13/cobra v1.8.1
-	golang.org/x/time v0.8.0
 )
 
 require (
