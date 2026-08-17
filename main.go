@@ -41,6 +41,8 @@ var (
 	expiryRange   string
 	loadFlag      bool
 	workloadFile  string
+	jsonOut       string
+	histOut       string
 
 	// arbitrary command mode
 	commands           []string
@@ -254,6 +256,7 @@ func run() {
 
 		sender := NewSender(clientsNum, addresses, password, pipeline, ops, nil)
 		sender.SetCommands(specs, valueSizer{fixed: ds, min: dsMin, max: dsMax}, keyPrefix, zeroPadding, randomData)
+		sender.SetOutputFiles(jsonOut, histOut)
 		if loadFlag {
 			_, _ = fmt.Fprintln(os.Stderr, "note: --load is ignored in command mode")
 		}
@@ -297,6 +300,7 @@ func run() {
 	}
 
 	sender := NewSender(clientsNum, addresses, password, pipeline, ops, workloads)
+	sender.SetOutputFiles(jsonOut, histOut)
 
 	// Load phase runs to completion (not bounded by --duration).
 	if loadFlag {
@@ -354,6 +358,9 @@ func main() {
 		"arbitrary command with __key__/__data__ placeholders (repeatable); enables command mode, ignoring --ratio/-t")
 	rootCmd.Flags().IntSliceVar(&commandRatios, "command-ratio", nil, "ratio for the i-th --command (default 1)")
 	rootCmd.Flags().StringArrayVar(&commandKeyPatterns, "command-key-pattern", nil, "key pattern (R/S/Z) for the i-th --command (default = --key-pattern)")
+
+	rootCmd.Flags().StringVar(&jsonOut, "json-out", "", "write a JSON summary to FILE (default: text summary to stdout)")
+	rootCmd.Flags().StringVar(&histOut, "hist-out", "", "write a standard HdrHistogram interval log (.hlog) to FILE, one tagged histogram per op (mergeable by any HdrHistogram tooling)")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

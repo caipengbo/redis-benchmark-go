@@ -62,6 +62,8 @@ Workload 相关：
 | `--expiry-range` | 空 | 随机 TTL（单位秒）min-max（覆盖 --expire） |
 | `--load` | false | 先顺序写满整个 key 空间再进入压测（让读能命中） |
 | `--workload` | `-P` 空 | 从预设文件加载内部参数（CLI 覆盖之） |
+| `--json-out` | 空 | 把 JSON 摘要写到文件（默认只在 stdout 打文本摘要） |
+| `--hist-out` | 空 | 把延迟直方图写成**标准 HdrHistogram `.hlog`**（V2 编码，每个 op 一条带 Tag 的直方图），可被任意 HdrHistogram 工具/库读取合并 |
 
 任意命令模式（见下节）：
 
@@ -175,6 +177,64 @@ pipeline=32
 - `--ops` 是**本进程全局总速率**，被所有 client 平摊，不是单 proxy 速率。
 - `-c` 开到几千时，压测机 `ulimit -n` 要够（每 client 1 conn），跑前先 `ulimit -n 100000`。
 
+## 结果输出与多实例汇总
+
+默认（不带任何输出 flag）：运行结束在 stdout 打印文本摘要（`SUMMARY-WRITE`/`SUMMARY-READ` 或命令模式的 `SUMMARY-<CMD>`），与传统压测工具一致。
+
+- `--json-out FILE`：写一份**人类可读的 JSON 摘要**（target/elapsed/ops_total/qps + 每个 op 的 count/min/mean/max/p50/p99/p999）。**总吞吐/QPS 从这里取**。
+- `--hist-out FILE`：写一份**标准 HdrHistogram 区间日志 `.hlog`**——每个 op 一条带 `Tag`（`WRITE`/`READ`/命令名）的 V2 压缩直方图。这是**跨语言、跨工具的标准交换格式**，可被任意 HdrHistogram 库（Java/Go/Rust/Python/JS…）或官方 plotter 直接读取、合并、绘图。~2KB/直方图，长跑不增长。
+
+`.hlog` 长这样（标准格式，节选）：
+```
+#[Histogram log format version 1.3]
+#[StartTime: 1786951726 (seconds since epoch), ...]
+"StartTimestamp","Interval_Length","Interval_Max","Interval_Compressed_Histogram"
+Tag=WRITE,1786951726.106,8.001,0.002553,HISTFAAAAl542iSO0Ut...（V2 base64）
+```
+
+**合并多实例结果**：分位数不可平均，必须把各实例的 HdrHistogram **合并后重算**。因为输出是标准 `.hlog`，用现成的 HdrHistogram 库几行就能合并（不需要本工具内置子命令）。示例（Python，`pip install hdrhistogram`）：
+
+```python
+#!/usr/bin/env python3
+# 用法: python3 merge_hlog.py run1.hlog run2.hlog ...
+import sys
+from collections import OrderedDict
+from hdrh.histogram import HdrHistogram
+from hdrh.log import HistogramLogReader
+
+LOW, HIGH, SIG = 1, 24 * 60 * 60 * 1000 * 1000, 3  # 需与压测端一致
+
+merged = OrderedDict()  # tag(op 名) -> 合并后的 HdrHistogram
+for path in sys.argv[1:]:
+    reader = HistogramLogReader(path, HdrHistogram(LOW, HIGH, SIG))
+    hist = reader.get_next_interval_histogram()
+    while hist is not None:
+        tag = hist.get_tag() or "UNTAGGED"
+        merged.setdefault(tag, HdrHistogram(LOW, HIGH, SIG)).add(hist)  # 合并
+        hist = reader.get_next_interval_histogram()
+
+for tag, h in merged.items():
+    print(f"{tag}: samples={h.get_total_count()} "
+          f"min={h.get_min_value()}us mean={int(h.get_mean_value())}us "
+          f"p50={h.get_value_at_percentile(50)}us "
+          f"p99={h.get_value_at_percentile(99)}us "
+          f"p999={h.get_value_at_percentile(99.9)}us "
+          f"max={h.get_max_value()}us")
+```
+
+```bash
+# 每个实例各压一个分片，产出 .hlog（+ 可选 json 摘要拿 QPS）
+for i in 1 2 3 4; do
+  ./redis-benchmark-go -a 10.0.0.$i:6379 --ops 25000 -d 60s \
+    --hist-out r$i.hlog --json-out r$i.json &
+done; wait
+
+python3 merge_hlog.py r1.hlog r2.hlog r3.hlog r4.hlog
+# WRITE: samples=... p50=...us p99=...us p999=...us max=...us   ← 全局真实分位
+```
+
+> 注意口径：`.hlog` 里每条直方图的 `samples`/`TotalCount` 是**延迟样本数（按 pipeline 批记录，≈ ops/pipeline）**，用于算分位；**命令数/QPS 用 `--json-out` 里的 `ops_total`/`count` 相加**。二者分工不同。官方在线 plotter（HdrHistogram Plotter）也可直接把 `.hlog` 拖进去画延迟分布图。
+
 ## 架构设计
 
 ```
@@ -205,6 +265,7 @@ Run 阶段：N 个 worker（各自独立，无中心分发，无共享限流）:
 - `data_generator.go` — 类型定义、`IsSupportedType`、非 string 的定值 payload
 - `sender.go` — 多 worker 发送、时刻表限流、读写 pipeline、命中统计、报表、load 阶段
 - `histogram.go` — 封装 HdrHistogram（加锁，按批记录），提供 p50/p99/p999 与 min/mean/max
+- `output.go` — JSON 摘要（`--json-out`）与标准 HdrHistogram `.hlog` 导出（`--hist-out`）
 
 ## 性能与调优经验
 

@@ -26,9 +26,16 @@ type Sender struct {
 
 	workloads  []*Workload
 	clients    []*client
+	addrs      []string
 	pipeline   int
 	maxValSize int
 	randomData bool
+
+	// output files (optional). jsonOut = human-readable JSON summary (no raw
+	// histogram); histOut = self-contained JSON incl. encoded histograms for
+	// cross-instance merge.
+	jsonOut string
+	histOut string
 
 	// perOpTickNs is the target ns-per-command for a single worker
 	// (clientNum*1e9/ops). 0 means full speed (no throttling).
@@ -125,6 +132,7 @@ func NewSender(clientNum int, addrs []string, password string, pipeline, ops int
 	return &Sender{
 		workloads:   workloads,
 		clients:     clients,
+		addrs:       addrs,
 		pipeline:    pipeline,
 		maxValSize:  maxVal,
 		randomData:  randomData,
@@ -132,6 +140,12 @@ func NewSender(clientNum int, addrs []string, password string, pipeline, ops int
 		writeHist:   newLatencyHist(),
 		readHist:    newLatencyHist(),
 	}
+}
+
+// SetOutputFiles enables optional JSON summary and/or mergeable histogram output.
+func (s *Sender) SetOutputFiles(jsonOut, histOut string) {
+	s.jsonOut = jsonOut
+	s.histOut = histOut
 }
 
 // Load pre-populates the whole key space for each workload once (sequential
@@ -191,6 +205,7 @@ func (s *Sender) Load(ctx context.Context) {
 func (s *Sender) Run(ctx context.Context) {
 	go s.report(ctx)
 
+	start := time.Now()
 	var wg sync.WaitGroup
 	for i, c := range s.clients {
 		wg.Add(1)
@@ -200,10 +215,13 @@ func (s *Sender) Run(ctx context.Context) {
 		}(i, c)
 	}
 	wg.Wait()
+	elapsed := time.Since(start)
 
 	for _, c := range s.clients {
 		c.close()
 	}
+
+	s.writeOutputs(start, elapsed)
 }
 
 func (s *Sender) worker(ctx context.Context, id int, c *client) {

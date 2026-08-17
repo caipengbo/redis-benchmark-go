@@ -53,3 +53,11 @@ func (h *latencyHist) stats() (min, mean, max time.Duration, count int64) {
 		time.Duration(h.hist.Max()) * time.Microsecond,
 		h.hist.TotalCount()
 }
+
+// exportSnapshot returns the HdrHistogram snapshot (fixed-size bucket counts +
+// config), used to serialize a mergeable histogram.
+func (h *latencyHist) exportSnapshot() *hdrhistogram.Snapshot {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.hist.Export()
+}

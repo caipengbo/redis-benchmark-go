@@ -30,7 +30,8 @@ REDIS_ADDR=127.0.0.1:6379 go test -race ./...   # 含 e2e，需可用 redis
 - `command.go` — 任意命令模式：`commandSpec`（模板 tokens + 独立 keyChooser/ratio/hist/count）、`valueSizer`、`buildArgs`（替换 `__key__`/`__data__`）。
 - `data_generator.go` — `Type` 常量、`IsSupportedType`、`typedValue`（非 string 的定值 payload）。
 - `sender.go` — 多 worker 引擎：`worker`（类型 workload 路径）/`workerCommand`（命令模式路径）、`Load`（预热）、`report`/`printSummary`、`addToPipeline`。
-- `histogram.go` — 封装 HdrHistogram（`sync.Mutex` 保护，按批记录），`record`/`percentile`/`stats`。
+- `histogram.go` — 封装 HdrHistogram（`sync.Mutex` 保护，按批记录），`record`/`percentile`/`stats`/`exportSnapshot`。
+- `output.go` — JSON 摘要（`--json-out`，含 QPS/分位，人读）；标准 HdrHistogram `.hlog` 导出（`--hist-out`，`HistogramLogWriter` + 每 op 一条带 Tag 的 V2 直方图，供任意 HdrHistogram 工具/库合并绘图）。
 
 ## 架构要点（改动时必须遵守）
 
