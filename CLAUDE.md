@@ -36,6 +36,7 @@ REDIS_ADDR=127.0.0.1:6379 go test -race ./...   # 含 e2e，需可用 redis
 ## 架构要点（改动时必须遵守）
 
 - **无中心分发、无共享 limiter**：每个 worker 自产自销。限流是**每 worker 绝对时刻表**：`perOpTickNs = clientNum*1e9/ops`，节流到 `startTime + opsDone*perOpTickNs`（drift-free、无锁、落后不补偿爆发）。不要退回令牌桶/共享 limiter。
+- **两个互斥的限流维度**：qps（`perOpTickNs`，按命令数）与带宽（`nsPerByte`，按写出的 value 字节，deadline 用 `startTime + float64(bytesDone)*nsPerByte` 现算，防整数塌零/溢出）。均为每 worker 绝对时刻表、drift-free。带宽仅 string 纯写（`--throughput`，校验挡掉命令模式/非 string/含 GET），`--load` 不受限；`--throughput` 会把 `ops` 强制归零（`effectiveOps`）以免默认 qps 抢限流。
 - **`--ops 0` = 全速**（不建 limiter）；>0 = 全局总速率按 client 均分。
 - **启动错峰**：每 worker 起步前随机 sleep 一个相位。
 - **低分配**：worker 复用 `Operation`/value 缓冲；`typedValue` 只算一次只读共享；热路径只留 key 一次 string 分配。新增热路径代码要保持低分配。

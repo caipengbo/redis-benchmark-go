@@ -82,6 +82,23 @@ func (w *Workload) maxValueSize() int {
 	return 1
 }
 
+// avgValueSize is the expected value size per write, used to estimate an
+// average batch's byte cost for the byte-rate startup jitter. Fixed size
+// returns dataSize; a range returns its midpoint; non-string types write no
+// value bytes (0).
+func (w *Workload) avgValueSize() float64 {
+	if w.t != String {
+		return 0
+	}
+	if w.dataSize > 0 {
+		return float64(w.dataSize)
+	}
+	if w.dataSizeMax > 0 {
+		return float64(w.dataSizeMin+w.dataSizeMax) / 2
+	}
+	return 1
+}
+
 // newWorkerState builds per-worker mutable state. bufSize is the max value size
 // across all workloads; randomData controls whether the value buffer is filled
 // with random bytes or a constant.
@@ -159,22 +176,26 @@ func (w *Workload) fillKey(st *workerState, op *Operation) {
 }
 
 // fillWrite sets the key, value and ttl for a write, choosing the key via the
-// configured distribution.
-func (w *Workload) fillWrite(st *workerState, op *Operation) {
-	w.fillWriteAt(st, op, w.keyChooser.Next(st.r))
+// configured distribution. It returns the number of value bytes written (0 for
+// non-string types), used by the byte-rate throttle and byte accounting.
+func (w *Workload) fillWrite(st *workerState, op *Operation) int {
+	return w.fillWriteAt(st, op, w.keyChooser.Next(st.r))
 }
 
-// fillWriteAt fills a write for an explicit key number (used by the load phase).
-func (w *Workload) fillWriteAt(st *workerState, op *Operation, keyNum int64) {
+// fillWriteAt fills a write for an explicit key number (used by the load
+// phase). It returns the number of value bytes written (0 for non-string types).
+func (w *Workload) fillWriteAt(st *workerState, op *Operation, keyNum int64) int {
 	op.key = w.buildKeyName(keyNum, st)
 	op.ttl = w.pickTTL(st)
 	if w.t == String {
-		op.strVal = st.valBuf[:w.pickValueSize(st)]
+		size := w.pickValueSize(st)
+		op.strVal = st.valBuf[:size]
 		op.typedVal = nil
-	} else {
-		op.strVal = nil
-		op.typedVal = w.typedVal
+		return size
 	}
+	op.strVal = nil
+	op.typedVal = w.typedVal
+	return 0
 }
 
 // WorkloadConfig holds the parameters needed to build a Workload for one type.

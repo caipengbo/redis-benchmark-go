@@ -51,7 +51,7 @@ func newTestSender(cfgs []WorkloadConfig, clients, pipeline, ops int) *Sender {
 	for i, c := range cfgs {
 		wls[i] = NewWorkload(c)
 	}
-	return NewSender(clients, []string{testAddr()}, "", pipeline, ops, wls)
+	return NewSender(clients, []string{testAddr()}, "", pipeline, ops, 0, wls)
 }
 
 func runFor(s *Sender, dur time.Duration) {
@@ -335,5 +335,40 @@ func TestThrottleWait(t *testing.T) {
 	// Timer must be reusable after the cancellation branch stopped it.
 	if !throttleWait(context.Background(), tm, time.Millisecond) {
 		t.Fatal("throttleWait returned false after the cancellation branch")
+	}
+}
+
+// TestSenderThroughputLimit is the byte-rate twin of TestSenderRateLimit: with
+// a fixed value size and a 1MB/s cap, the total written value bytes over the
+// run must stay within a tolerant upper bound (and be non-trivial).
+func TestSenderThroughputLimit(t *testing.T) {
+	rdb := dialTest(t)
+	defer rdb.Close()
+
+	prefix := uniquePrefix("tp")
+	defer cleanup(t, rdb, prefix)
+
+	const bytesPerSec = int64(1024 * 1024) // 1MB/s
+	const dur = 2 * time.Second
+	const valSize = 512
+
+	cfg := baseCfg(String, prefix)
+	cfg.DataSize = valSize
+	wl := NewWorkload(cfg)
+	s := NewSender(4, []string{testAddr()}, "", 10, 0, bytesPerSec, []*Workload{wl})
+	runFor(s, dur)
+
+	got := s.bytesWritten.Load()
+	sec := int64(dur / time.Second)
+
+	// Upper bound: allow a couple extra seconds' worth for startup/tail slack,
+	// same tolerance shape as the ops rate-limit test.
+	maxExpected := bytesPerSec * (sec + 3)
+	if got > maxExpected {
+		t.Errorf("throughput-limited bytes = %d exceeds max expected %d", got, maxExpected)
+	}
+	// Lower bound: should have made real progress (at least ~1s worth).
+	if got < bytesPerSec {
+		t.Errorf("throughput-limited bytes = %d too low for %v at %d B/s", got, dur, bytesPerSec)
 	}
 }

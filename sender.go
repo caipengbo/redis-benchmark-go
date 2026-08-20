@@ -16,10 +16,11 @@ import (
 )
 
 type Sender struct {
-	counter    atomic.Int64
-	readCount  atomic.Int64
-	writeCount atomic.Int64
-	missCount  atomic.Int64
+	counter      atomic.Int64
+	readCount    atomic.Int64
+	writeCount   atomic.Int64
+	missCount    atomic.Int64
+	bytesWritten atomic.Int64 // total value bytes written (for reporting + byte-rate limit)
 
 	writeHist *latencyHist
 	readHist  *latencyHist
@@ -37,9 +38,18 @@ type Sender struct {
 	jsonOut string
 	histOut string
 
+	// config is the effective run configuration, printed at startup and
+	// embedded in the text/JSON summaries. Optional (nil if not set).
+	config *RunConfig
+
 	// perOpTickNs is the target ns-per-command for a single worker
 	// (clientNum*1e9/ops). 0 means full speed (no throttling).
 	perOpTickNs int64
+
+	// nsPerByte is the target ns-per-value-byte for a single worker
+	// (clientNum*1e9/bytesPerSec). 0 means no byte-rate throttling. Mutually
+	// exclusive with perOpTickNs (enforced at flag validation).
+	nsPerByte float64
 
 	// command mode (arbitrary commands). When non-empty, workers run these
 	// instead of the type-based workloads.
@@ -85,7 +95,12 @@ type client struct {
 	rdb *redis.Client
 }
 
-func NewSender(clientNum int, addrs []string, password string, pipeline, ops int, workloads []*Workload) *Sender {
+// throughputPrecisionFloorNs is the per-worker ns-per-byte below which the
+// byte-rate throttle can no longer be applied precisely (roughly >1 GiB/s per
+// worker). We warn but do not error or fall back.
+const throughputPrecisionFloorNs = 1.0
+
+func NewSender(clientNum int, addrs []string, password string, pipeline, ops int, bytesPerSec int64, workloads []*Workload) *Sender {
 	if len(addrs) == 0 {
 		addrs = []string{""}
 	}
@@ -118,6 +133,19 @@ func NewSender(clientNum int, addrs []string, password string, pipeline, ops int
 		}
 	}
 
+	var nsPerByte float64
+	if bytesPerSec > 0 && clientNum > 0 {
+		perWorkerBps := float64(bytesPerSec) / float64(clientNum)
+		if perWorkerBps > 0 {
+			nsPerByte = 1e9 / perWorkerBps
+			if nsPerByte < throughputPrecisionFloorNs {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"warning: per-worker throughput very high (~%.2f ns/byte); byte-rate limiting may be imprecise, consider more clients\n",
+					nsPerByte)
+			}
+		}
+	}
+
 	maxVal := 1
 	randomData := false
 	for _, wl := range workloads {
@@ -137,6 +165,7 @@ func NewSender(clientNum int, addrs []string, password string, pipeline, ops int
 		maxValSize:  maxVal,
 		randomData:  randomData,
 		perOpTickNs: perOpTickNs,
+		nsPerByte:   nsPerByte,
 		writeHist:   newLatencyHist(),
 		readHist:    newLatencyHist(),
 	}
@@ -146,6 +175,12 @@ func NewSender(clientNum int, addrs []string, password string, pipeline, ops int
 func (s *Sender) SetOutputFiles(jsonOut, histOut string) {
 	s.jsonOut = jsonOut
 	s.histOut = histOut
+}
+
+// SetConfig attaches the effective run configuration for startup logging and
+// summary embedding.
+func (s *Sender) SetConfig(cfg *RunConfig) {
+	s.config = cfg
 }
 
 // Load pre-populates the whole key space for each workload once (sequential
@@ -203,6 +238,14 @@ func (s *Sender) Load(ctx context.Context) {
 }
 
 func (s *Sender) Run(ctx context.Context) {
+	if s.config != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "=== run config ===")
+		for _, line := range s.config.lines() {
+			_, _ = fmt.Fprintln(os.Stderr, line)
+		}
+		_, _ = fmt.Fprintln(os.Stderr, "==================")
+	}
+
 	go s.report(ctx)
 
 	start := time.Now()
@@ -224,12 +267,34 @@ func (s *Sender) Run(ctx context.Context) {
 	s.writeOutputs(start, elapsed)
 }
 
+// startupJitter returns a random startup phase to de-synchronize workers so
+// their throttle schedules don't align into bursts. In qps mode it's a random
+// fraction of one batch's tick budget; in byte-rate mode it's a random fraction
+// of an average batch's byte-cost time. Zero when running full speed.
+func (s *Sender) startupJitter(st *workerState) time.Duration {
+	if s.perOpTickNs > 0 {
+		return time.Duration(st.r.Int63n(s.perOpTickNs*int64(s.pipeline) + 1))
+	}
+	if s.nsPerByte > 0 {
+		avgVal := 0.0
+		for _, wl := range s.workloads {
+			if v := wl.avgValueSize(); v > avgVal {
+				avgVal = v
+			}
+		}
+		avgBatchNs := float64(s.pipeline) * avgVal * s.nsPerByte
+		if avgBatchNs >= 1 {
+			return time.Duration(st.r.Int63n(int64(avgBatchNs) + 1))
+		}
+	}
+	return 0
+}
+
 func (s *Sender) worker(ctx context.Context, id int, c *client) {
 	if s.cmdMode() {
 		s.workerCommand(ctx, id, c)
 		return
 	}
-
 	st := newWorkerState(int64(id)+1, s.maxValSize, s.randomData)
 
 	batch := make([]*Operation, s.pipeline)
@@ -239,8 +304,7 @@ func (s *Sender) worker(ctx context.Context, id int, c *client) {
 	getCmds := make([]*redis.StringCmd, s.pipeline)
 	round := id
 
-	if s.perOpTickNs > 0 {
-		jitter := time.Duration(st.r.Int63n(s.perOpTickNs*int64(s.pipeline) + 1))
+	if jitter := s.startupJitter(st); jitter > 0 {
 		select {
 		case <-ctx.Done():
 			return
@@ -250,6 +314,7 @@ func (s *Sender) worker(ctx context.Context, id int, c *client) {
 
 	startTime := time.Now()
 	var opsDone int64
+	var bytesDone int64
 
 	throttleTimer := time.NewTimer(time.Hour)
 	throttleTimer.Stop()
@@ -263,6 +328,7 @@ func (s *Sender) worker(ctx context.Context, id int, c *client) {
 		round++
 		isRead := wl.pickRead(st)
 
+		batchBytes := int64(0)
 		pipe := c.rdb.Pipeline()
 		if isRead {
 			for j := 0; j < s.pipeline; j++ {
@@ -271,7 +337,7 @@ func (s *Sender) worker(ctx context.Context, id int, c *client) {
 			}
 		} else {
 			for j := 0; j < s.pipeline; j++ {
-				wl.fillWrite(st, batch[j])
+				batchBytes += int64(wl.fillWrite(st, batch[j]))
 			}
 			addToPipeline(ctx, pipe, wl.t, batch)
 		}
@@ -307,10 +373,21 @@ func (s *Sender) worker(ctx context.Context, id int, c *client) {
 		} else {
 			s.writeHist.record(lat)
 			s.writeCount.Add(int64(s.pipeline))
+			if batchBytes > 0 {
+				bytesDone += batchBytes
+				s.bytesWritten.Add(batchBytes)
+			}
 		}
 
 		if s.perOpTickNs > 0 {
 			deadline := startTime.Add(time.Duration(opsDone * s.perOpTickNs))
+			if d := time.Until(deadline); d > 0 {
+				if !throttleWait(ctx, throttleTimer, d) {
+					return
+				}
+			}
+		} else if s.nsPerByte > 0 {
+			deadline := startTime.Add(time.Duration(float64(bytesDone) * s.nsPerByte))
 			if d := time.Until(deadline); d > 0 {
 				if !throttleWait(ctx, throttleTimer, d) {
 					return
@@ -348,8 +425,12 @@ func (s *Sender) workerCommand(ctx context.Context, id int, c *client) {
 
 		spec := s.pickCommand(st)
 		pipe := c.rdb.Pipeline()
+		batchBytes := int64(0)
 		for j := 0; j < s.pipeline; j++ {
 			val := st.valBuf[:s.cmdSizer.size(st)]
+			if spec.hasData {
+				batchBytes += int64(len(val))
+			}
 			args := spec.buildArgs(st, s.cmdPrefix, s.cmdZeroPad, val)
 			pipe.Do(ctx, args...)
 		}
@@ -370,6 +451,9 @@ func (s *Sender) workerCommand(ctx context.Context, id int, c *client) {
 		spec.count.Add(int64(s.pipeline))
 		spec.hist.record(lat)
 		opsDone += int64(s.pipeline)
+		if batchBytes > 0 {
+			s.bytesWritten.Add(batchBytes)
+		}
 
 		if s.perOpTickNs > 0 {
 			deadline := startTime.Add(time.Duration(opsDone * s.perOpTickNs))
@@ -393,15 +477,19 @@ func (s *Sender) report(ctx context.Context) {
 
 	lastReportTime := time.Now()
 	lastCounter := s.counter.Load()
+	lastBytes := s.bytesWritten.Load()
 
 	printStatus := func(final bool) {
 		now := time.Now()
 		cur := s.counter.Load()
+		curBytes := s.bytesWritten.Load()
 		elapsed := now.Sub(lastReportTime).Seconds()
 
 		instant := 0.0
+		mbps := 0.0
 		if elapsed > 0 {
 			instant = float64(cur-lastCounter) / elapsed
+			mbps = float64(curBytes-lastBytes) / elapsed / (1024 * 1024)
 		}
 		if !final {
 			if len(rates) == window {
@@ -427,11 +515,11 @@ func (s *Sender) report(ctx context.Context) {
 			for _, cs := range s.commands {
 				fmt.Fprintf(&sb, "\t%s_p99: %s", cs.name, cs.hist.percentile(0.99))
 			}
-			_, _ = fmt.Fprintf(w, "%s\tcounter: %d\tops: %d\tavg(%ds): %d%s\n",
-				now.Format("2006-01-02 15:04:05"), cur, int(math.Round(shownOps)), window, int(math.Round(avg)), sb.String())
+			_, _ = fmt.Fprintf(w, "%s\tcounter: %d\tops: %d\tavg(%ds): %d\tmb/s: %.2f%s\n",
+				now.Format("2006-01-02 15:04:05"), cur, int(math.Round(shownOps)), window, int(math.Round(avg)), mbps, sb.String())
 		} else {
-			_, _ = fmt.Fprintf(w, "%s\tcounter: %d\tops: %d\tavg(%ds): %d\twrite_p99: %s\tread_p99: %s\n",
-				now.Format("2006-01-02 15:04:05"), cur, int(math.Round(shownOps)), window, int(math.Round(avg)),
+			_, _ = fmt.Fprintf(w, "%s\tcounter: %d\tops: %d\tavg(%ds): %d\tmb/s: %.2f\twrite_p99: %s\tread_p99: %s\n",
+				now.Format("2006-01-02 15:04:05"), cur, int(math.Round(shownOps)), window, int(math.Round(avg)), mbps,
 				s.writeHist.percentile(0.99), s.readHist.percentile(0.99))
 		}
 		_ = w.Flush()
@@ -447,11 +535,20 @@ func (s *Sender) report(ctx context.Context) {
 			printStatus(false)
 			lastReportTime = time.Now()
 			lastCounter = s.counter.Load()
+			lastBytes = s.bytesWritten.Load()
 		}
 	}
 }
 
 func (s *Sender) printSummary(w *tabwriter.Writer) {
+	if s.config != nil {
+		_ = w.Flush()
+		_, _ = fmt.Fprintln(os.Stdout, "=== run config ===")
+		for _, line := range s.config.lines() {
+			_, _ = fmt.Fprintln(os.Stdout, line)
+		}
+		_, _ = fmt.Fprintln(os.Stdout, "==================")
+	}
 	if s.cmdMode() {
 		for _, cs := range s.commands {
 			cmin, cmean, cmax, _ := cs.hist.stats()
@@ -459,6 +556,9 @@ func (s *Sender) printSummary(w *tabwriter.Writer) {
 				"SUMMARY-%s\tcount: %d\tmin: %s\tmean: %s\tmax: %s\tp50: %s\tp99: %s\tp999: %s\n",
 				cs.name, cs.count.Load(), cmin, cmean, cmax,
 				cs.hist.percentile(0.50), cs.hist.percentile(0.99), cs.hist.percentile(0.999))
+		}
+		if bytes := s.bytesWritten.Load(); bytes > 0 {
+			_, _ = fmt.Fprintf(w, "SUMMARY-BYTES\ttotal: %.2f MB\n", float64(bytes)/(1024*1024))
 		}
 		_ = w.Flush()
 		return
@@ -485,6 +585,9 @@ func (s *Sender) printSummary(w *tabwriter.Writer) {
 			"SUMMARY-READ\tcount: %d\tmiss: %d (%.2f%%)\tmin: %s\tmean: %s\tmax: %s\tp50: %s\tp99: %s\tp999: %s\n",
 			reads, miss, missRate, rmin, rmean, rmax,
 			s.readHist.percentile(0.50), s.readHist.percentile(0.99), s.readHist.percentile(0.999))
+	}
+	if bytes := s.bytesWritten.Load(); bytes > 0 {
+		_, _ = fmt.Fprintf(w, "SUMMARY-BYTES\ttotal: %.2f MB\n", float64(bytes)/(1024*1024))
 	}
 	_ = w.Flush()
 }

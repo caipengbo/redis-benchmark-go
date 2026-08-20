@@ -43,6 +43,7 @@ var (
 	workloadFile  string
 	jsonOut       string
 	histOut       string
+	throughput    string
 
 	// arbitrary command mode
 	commands           []string
@@ -59,7 +60,7 @@ var (
 					return err
 				}
 			}
-			return validateFlags()
+			return validateFlags(cmd)
 		},
 		Run: func(cmd *cobra.Command, args []string) {
 			if versionFlag {
@@ -108,7 +109,7 @@ func applyWorkloadFile(cmd *cobra.Command, path string) error {
 	return scanner.Err()
 }
 
-func validateFlags() error {
+func validateFlags(cmd *cobra.Command) error {
 	for i := 0; i < len(dataTypes); i++ {
 		if !IsSupportedType(strings.ToLower(dataTypes[i])) {
 			return fmt.Errorf("unsupported data type: %s", dataTypes[i])
@@ -167,7 +168,77 @@ func validateFlags() error {
 			}
 		}
 	}
+	if throughput != "" {
+		if _, err := parseThroughput(throughput); err != nil {
+			return fmt.Errorf("throughput: %v", err)
+		}
+		// --throughput throttles written value bytes; it is mutually exclusive
+		// with --ops and only meaningful for string pure-write workloads.
+		if cmd.Flags().Changed("ops") {
+			return errors.New("--throughput is mutually exclusive with --ops")
+		}
+		if len(commands) > 0 {
+			return errors.New("--throughput is not supported in command mode")
+		}
+		for _, t := range dataTypes {
+			if t != "" && Type(t) != String {
+				return fmt.Errorf("--throughput only supports the string type (got %q)", t)
+			}
+		}
+		if _, getW, err := parseRatio(ratio); err == nil && getW > 0 {
+			return errors.New("--throughput requires a pure-write ratio (GET weight must be 0)")
+		}
+	}
 	return nil
+}
+
+// parseThroughput parses a byte-rate string like "1MB/s", "500KB", "2M" or
+// "1024B" into bytes per second. Units are B/KB/MB/GB (case-insensitive,
+// 1KB=1024); a trailing "/s" is optional and ignored (the value is always a
+// per-second rate). A bare number with no unit is treated as bytes.
+func parseThroughput(s string) (int64, error) {
+	str := strings.TrimSpace(s)
+	if str == "" {
+		return 0, fmt.Errorf("empty value")
+	}
+	lower := strings.ToLower(str)
+	lower = strings.TrimSuffix(lower, "/s")
+	lower = strings.TrimSpace(lower)
+	if lower == "" {
+		return 0, fmt.Errorf("invalid value %q", s)
+	}
+
+	var mult int64 = 1
+	switch {
+	case strings.HasSuffix(lower, "gb"):
+		mult, lower = 1024*1024*1024, strings.TrimSuffix(lower, "gb")
+	case strings.HasSuffix(lower, "mb"):
+		mult, lower = 1024*1024, strings.TrimSuffix(lower, "mb")
+	case strings.HasSuffix(lower, "kb"):
+		mult, lower = 1024, strings.TrimSuffix(lower, "kb")
+	case strings.HasSuffix(lower, "g"):
+		mult, lower = 1024*1024*1024, strings.TrimSuffix(lower, "g")
+	case strings.HasSuffix(lower, "m"):
+		mult, lower = 1024*1024, strings.TrimSuffix(lower, "m")
+	case strings.HasSuffix(lower, "k"):
+		mult, lower = 1024, strings.TrimSuffix(lower, "k")
+	case strings.HasSuffix(lower, "b"):
+		mult, lower = 1, strings.TrimSuffix(lower, "b")
+	}
+	lower = strings.TrimSpace(lower)
+
+	n, err := strconv.ParseInt(lower, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid value %q", s)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("throughput must be positive, got %q", s)
+	}
+	bps := n * mult
+	if bps <= 0 { // overflow guard
+		return 0, fmt.Errorf("throughput too large: %q", s)
+	}
+	return bps, nil
 }
 
 func parseRatio(s string) (setW, getW int, err error) {
@@ -237,6 +308,57 @@ func run() {
 		ds = 0
 	}
 
+	var bytesPerSec int64
+	effectiveOps := ops
+	if throughput != "" {
+		bytesPerSec, _ = parseThroughput(throughput)
+		// --throughput is mutually exclusive with --ops (validated), but --ops
+		// has a non-zero default; force it off so the byte-rate throttle (not a
+		// stale default qps) governs the run.
+		effectiveOps = 0
+	}
+
+	// throttleDesc summarizes the active rate-limit dimension for the config dump.
+	throttleDesc := "full speed (unlimited)"
+	if bytesPerSec > 0 {
+		throttleDesc = fmt.Sprintf("throughput %s (%d B/s)", throughput, bytesPerSec)
+	} else if effectiveOps > 0 {
+		throttleDesc = fmt.Sprintf("%d ops/s", effectiveOps)
+	}
+
+	// valueSizeDesc describes how string value size is chosen.
+	valueSizeDesc := fmt.Sprintf("%d B (fixed)", ds)
+	if dataSizeRange != "" {
+		valueSizeDesc = fmt.Sprintf("[%d, %d] B (random)", dsMin, dsMax)
+	}
+	if randomData {
+		valueSizeDesc += ", random bytes"
+	}
+
+	expireDesc := ""
+	if expiryRange != "" {
+		expireDesc = "random " + expiryRange + "s"
+	} else if expire != "" {
+		expireDesc = expire
+	}
+
+	cfg := &RunConfig{
+		Target:     strings.Join(addresses, ","),
+		Clients:    clientsNum,
+		Duration:   duration,
+		Pipeline:   pipeline,
+		KeyPattern: pattern,
+		KeyMin:     keyMin,
+		KeyMax:     keyMax,
+		ValueSize:  valueSizeDesc,
+		Throttle:   throttleDesc,
+		Load:       loadFlag,
+		Expire:     expireDesc,
+	}
+	if len(addresses) == 0 {
+		cfg.Target = "(default 127.0.0.1:6379)"
+	}
+
 	// Command mode: arbitrary commands override the type-based workload and
 	// --ratio.
 	if len(commands) > 0 {
@@ -254,9 +376,13 @@ func run() {
 			specs[i] = newCommandSpec(tmpl, ratio, kc)
 		}
 
-		sender := NewSender(clientsNum, addresses, password, pipeline, ops, nil)
+		sender := NewSender(clientsNum, addresses, password, pipeline, effectiveOps, bytesPerSec, nil)
 		sender.SetCommands(specs, valueSizer{fixed: ds, min: dsMin, max: dsMax}, keyPrefix, zeroPadding, randomData)
 		sender.SetOutputFiles(jsonOut, histOut)
+		cfg.Mode = "command"
+		cfg.Commands = commands
+		// In command mode value size feeds __data__ substitution.
+		sender.SetConfig(cfg)
 		if loadFlag {
 			_, _ = fmt.Fprintln(os.Stderr, "note: --load is ignored in command mode")
 		}
@@ -299,8 +425,12 @@ func run() {
 		os.Exit(1)
 	}
 
-	sender := NewSender(clientsNum, addresses, password, pipeline, ops, workloads)
+	sender := NewSender(clientsNum, addresses, password, pipeline, effectiveOps, bytesPerSec, workloads)
 	sender.SetOutputFiles(jsonOut, histOut)
+	cfg.Mode = "workload"
+	cfg.DataTypes = strings.Join(dataTypes, ",")
+	cfg.Ratio = ratio
+	sender.SetConfig(cfg)
 
 	// Load phase runs to completion (not bounded by --duration).
 	if loadFlag {
@@ -361,6 +491,7 @@ func main() {
 
 	rootCmd.Flags().StringVar(&jsonOut, "json-out", "", "write a JSON summary to FILE (default: text summary to stdout)")
 	rootCmd.Flags().StringVar(&histOut, "hist-out", "", "write a standard HdrHistogram interval log (.hlog) to FILE, one tagged histogram per op (mergeable by any HdrHistogram tooling)")
+	rootCmd.Flags().StringVar(&throughput, "throughput", "", "limit the written value byte rate, e.g. 1MB/s / 500KB (units B/KB/MB/GB, 1KB=1024, /s optional); mutually exclusive with --ops, string pure-write only")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

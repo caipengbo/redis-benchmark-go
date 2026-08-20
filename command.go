@@ -41,6 +41,7 @@ type commandSpec struct {
 	tokens     []string
 	keyChooser Generator
 	ratio      int
+	hasData    bool // true if the template contains a __data__ placeholder
 
 	hist  *latencyHist
 	count atomic.Int64
@@ -55,11 +56,19 @@ func newCommandSpec(template string, ratio int, keyChooser Generator) *commandSp
 	if ratio < 1 {
 		ratio = 1
 	}
+	hasData := false
+	for _, t := range toks {
+		if t == "__data__" {
+			hasData = true
+			break
+		}
+	}
 	return &commandSpec{
 		name:       name,
 		tokens:     toks,
 		keyChooser: keyChooser,
 		ratio:      ratio,
+		hasData:    hasData,
 		hist:       newLatencyHist(),
 	}
 }

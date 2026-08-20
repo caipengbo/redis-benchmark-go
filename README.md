@@ -8,6 +8,7 @@
 - [快速开始](#快速开始)
 - [命令行参数](#命令行参数)
 - [Workload 机制](#workload-机制)
+- [灌数据 / 造数据集](#灌数据--造数据集)
 - [使用示例](#使用示例)
 - [预设文件 -P](#预设文件--p)
 - [针对 Proxy 集群的压测](#针对-proxy-集群的压测)
@@ -42,6 +43,7 @@ go build -o redis-benchmark-go .
 | `--pipeline` | | 16 | 每批 pipeline 的命令数 |
 | `--fields` | | 8 | hash/zset/set/list 的字段数 |
 | `--ops` | | 10000 | 全局发送速率(命令/秒)，**0 表示全速无限流** |
+| `--throughput` | | 空 | 限制**写出的 value 字节速率**，如 `1MB/s`/`500KB`（B/KB/MB/GB，1KB=1024，`/s` 可选）；与 `--ops` 互斥，仅 string 纯写 |
 | `--version` | `-v` | | 打印版本 |
 
 Workload 相关：
@@ -89,6 +91,40 @@ Workload 相关：
 report 会打印 `miss` 比例，miss 高说明读打到了未写入的 key。
 
 **多类型注意**：新 key 格式 `{prefix}{number}` 不再编码类型，多个 `-t` 类型共用同一 key 空间会**撞 key（WRONGTYPE 错误）**。混合多类型时请给不同类型配不同 `--key-prefix`，或一次只压一种类型。
+
+## 灌数据 / 造数据集
+
+除了压测，本工具也很适合**快速把一批数据灌进 Redis**（造测试数据集、预热、复现某个内存规模的现场）。核心是 `--load`：
+
+- `--load` 会**顺序写满整个 key 空间 `[--key-minimum, --key-maximum]` 一次**，全 client 并行 + pipeline、全速；**写满即自动退出**（不看 `--duration`，也不用手动 `Ctrl-C`/`kill`），结束打印 `load finished: N keys written`。
+- 造数据集时**必须显式给定 key 区间**——`--key-minimum`/`--key-maximum` 决定写多少个 key。value 大小由 `--data-size`（定长）或 `--data-size-range`（变长）决定。
+
+```bash
+# 灌 100 万个 1KB 定长 string（key 区间 [0, 1000000]），写满自动退出
+./redis-benchmark-go -a 127.0.0.1:6379 --load \
+  --key-pattern S --data-size 1024 -t string \
+  --key-minimum 0 --key-maximum 1000000
+```
+
+**增量累加**（分档扩容数据集，每档只补灌差量，不重复、不撞 key）——把 `--key-minimum` 接到上一档末尾即可：
+
+```bash
+# 第 1 档：灌 [0, 1_100_000]           → 约 1.5G（1KB value 下 ≈1352 B/key）
+./redis-benchmark-go -a 127.0.0.1:6379 --load \
+  --key-pattern S --data-size 1024 -t string --key-minimum 0       --key-maximum 1100000
+
+# 第 2 档：只补灌 [1_100_001, 8_000_000] → 累加到约 10G
+./redis-benchmark-go -a 127.0.0.1:6379 --load \
+  --key-pattern S --data-size 1024 -t string --key-minimum 1100001 --key-maximum 8000000
+```
+
+> 想灌到「某个 `used_memory` 目标」时：先估算每 key 字节数（定长 value 很稳，如 1KB value ≈ 1352 B/key，含 key/对象/dict 开销），换算出 `--key-maximum`，灌完用 `redis-cli INFO memory` 的 `used_memory_human` 核对。
+
+**要点**
+- 灌纯数据用 `--ratio 1:0`（默认就是纯写），别带 GET。
+- 用 `--key-pattern S`（顺序）保证 key 不重复、区间连续可续灌；R/Z 会随机命中区间内的 key，适合压测但不适合「把区间灌满」。
+- 造 list/hash/set/zset 数据集用 `-t <type>`（`--fields` 控字段数）或[任意命令模式](#任意命令模式--command)。
+- `--load` 阶段不受 `--ops`/`--throughput` 限流，始终全速。
 
 ## 任意命令模式（--command）
 
@@ -144,6 +180,8 @@ SUMMARY-HGET  count: 160220  ... p99: 281µs
 ./redis-benchmark-go -a 127.0.0.1:6379 --ops 0 -c 8 --pipeline 32
 ```
 
+> 灌数据 / 造数据集的姿势见[灌数据 / 造数据集](#灌数据--造数据集)（用 `--load`，写满自动退出）。
+
 ## 预设文件 -P
 
 `-P/--workload FILE` 加载**内部参数**（就是上面这些 flag，key=value 一行一个，`#` 注释）。CLI 上显式给的 flag 会覆盖文件里的值；出现未知参数名会报错。
@@ -177,11 +215,28 @@ pipeline=32
 - `--ops` 是**本进程全局总速率**，被所有 client 平摊，不是单 proxy 速率。
 - `-c` 开到几千时，压测机 `ulimit -n` 要够（每 client 1 conn），跑前先 `ulimit -n 100000`。
 
+## 带宽限流（`--throughput`）
+
+`--ops` 按**命令数/秒**限流；`--throughput` 提供一个正交的维度，按**写出的 value 字节数/秒**限流：
+
+```bash
+# 把写带宽压到 1MB/s（定长 1KB value），实测 mb/s 列会收敛到 ~1.00
+./redis-benchmark-go -a 127.0.0.1:6379 --throughput 1MB/s -d 5s --data-size 1024 -t string
+```
+
+- **量纲**：只统计**写路径的 value payload 字节**，不含 key、协议帧、读回包。单位 `B/KB/MB/GB`（**1KB=1024**，非 1000），`/s` 后缀可有可无（值始终按「每秒」解释），裸数字按字节。
+- **约束**：与 `--ops` **互斥**（同时给会报错）；**仅 string 纯写**——命令模式（`--command`）、非 string 的 `-t`、或 `--ratio` 里 GET 权重 > 0 都会报错。
+- **均分**：`--throughput` 是本进程**全局总带宽**，按 client 数均分到每个 worker（与 `--ops` 同款每 worker 绝对时刻表、drift-free）。
+- **`--load` 不受限**：预热阶段全速写满 key 空间，不受带宽限流（与 `--ops` 对 load 的处理一致）。
+- **可观测**：实时进度和 `SUMMARY-BYTES` 始终显示实际写带宽（`mb/s` 列 + `total: X MB`），qps 模式下也会显示，口径一致（1024 进制）。`--json-out` 里对应 `bytes_total` / `mbps` 字段。
+- **变长 value 的短期抖动**：用 `--data-size-range min-max` 时，每个 worker 按各自的 rand 采样 value 大小，单批字节数不定 → 瞬时 `mb/s` 会波动，但**全局带宽长期收敛到目标值**；定长 `--data-size` 无此抖动。
+- **过高带宽提示**：当每 worker 的目标带宽极高（约 >1GiB/s/worker，`nsPerByte < 1`）时会在 stderr 温和提示限流可能不精确，建议加大 `-c`；**不报错、不退化**。
+
 ## 结果输出与多实例汇总
 
 默认（不带任何输出 flag）：运行结束在 stdout 打印文本摘要（`SUMMARY-WRITE`/`SUMMARY-READ` 或命令模式的 `SUMMARY-<CMD>`），与传统压测工具一致。
 
-- `--json-out FILE`：写一份**人类可读的 JSON 摘要**（target/elapsed/ops_total/qps + 每个 op 的 count/min/mean/max/p50/p99/p999）。**总吞吐/QPS 从这里取**。
+- `--json-out FILE`：写一份**人类可读的 JSON 摘要**（target/elapsed/ops_total/qps + `bytes_total`/`mbps` + 每个 op 的 count/min/mean/max/p50/p99/p999）。**总吞吐/QPS 从这里取**。
 - `--hist-out FILE`：写一份**标准 HdrHistogram 区间日志 `.hlog`**——每个 op 一条带 `Tag`（`WRITE`/`READ`/命令名）的 V2 压缩直方图。这是**跨语言、跨工具的标准交换格式**，可被任意 HdrHistogram 库（Java/Go/Rust/Python/JS…）或官方 plotter 直接读取、合并、绘图。~2KB/直方图，长跑不增长。
 
 `.hlog` 长这样（标准格式，节选）：

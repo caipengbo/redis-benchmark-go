@@ -28,9 +28,63 @@ type runReport struct {
 	End        string                 `json:"end"`
 	ElapsedSec float64                `json:"elapsed_sec"`
 	Mode       string                 `json:"mode"`
+	Config     *RunConfig             `json:"config,omitempty"`
 	OpsTotal   int64                  `json:"ops_total"`
 	QPS        float64                `json:"qps"`
+	BytesTotal int64                  `json:"bytes_total"`
+	MBPS       float64                `json:"mbps"`
 	Metrics    map[string]*metricJSON `json:"metrics"`
+}
+
+// RunConfig captures the effective run parameters (after preset-file and flag
+// resolution) so a run is self-documenting: printed to stderr at startup and
+// embedded in both the text summary and the JSON report.
+type RunConfig struct {
+	Target     string   `json:"target"`
+	Clients    int      `json:"clients"`
+	Duration   string   `json:"duration"`
+	Pipeline   int      `json:"pipeline"`
+	Mode       string   `json:"mode"`
+	DataTypes  string   `json:"data_types,omitempty"`
+	Commands   []string `json:"commands,omitempty"`
+	Ratio      string   `json:"ratio,omitempty"`
+	KeyPattern string   `json:"key_pattern"`
+	KeyMin     int64    `json:"key_min"`
+	KeyMax     int64    `json:"key_max"`
+	ValueSize  string   `json:"value_size"`
+	Throttle   string   `json:"throttle"`
+	Load       bool     `json:"load"`
+	Expire     string   `json:"expire,omitempty"`
+}
+
+// lines renders the config as aligned "  key: value" rows for the text output.
+func (c *RunConfig) lines() []string {
+	out := []string{
+		fmt.Sprintf("  target:      %s", c.Target),
+		fmt.Sprintf("  clients:     %d", c.Clients),
+		fmt.Sprintf("  duration:    %s", c.Duration),
+		fmt.Sprintf("  pipeline:    %d", c.Pipeline),
+		fmt.Sprintf("  mode:        %s", c.Mode),
+	}
+	if c.Mode == "command" {
+		for i, cmd := range c.Commands {
+			out = append(out, fmt.Sprintf("  command[%d]:  %s", i, cmd))
+		}
+	} else {
+		out = append(out, fmt.Sprintf("  data-types:  %s", c.DataTypes))
+		out = append(out, fmt.Sprintf("  ratio:       %s", c.Ratio))
+	}
+	out = append(out,
+		fmt.Sprintf("  key-pattern: %s", c.KeyPattern),
+		fmt.Sprintf("  key-range:   [%d, %d]", c.KeyMin, c.KeyMax),
+		fmt.Sprintf("  value-size:  %s", c.ValueSize),
+		fmt.Sprintf("  throttle:    %s", c.Throttle),
+		fmt.Sprintf("  load:        %t", c.Load),
+	)
+	if c.Expire != "" {
+		out = append(out, fmt.Sprintf("  expire:      %s", c.Expire))
+	}
+	return out
 }
 
 func metricFromHist(h *latencyHist, count, miss int64) *metricJSON {
@@ -77,16 +131,19 @@ func (s *Sender) buildReport(start time.Time, elapsed time.Duration) *runReport 
 		End:        start.Add(elapsed).UTC().Format(time.RFC3339),
 		ElapsedSec: elapsed.Seconds(),
 		OpsTotal:   s.counter.Load(),
+		BytesTotal: s.bytesWritten.Load(),
 		Metrics:    map[string]*metricJSON{},
 	}
 	if elapsed.Seconds() > 0 {
 		rep.QPS = float64(rep.OpsTotal) / elapsed.Seconds()
+		rep.MBPS = float64(rep.BytesTotal) / elapsed.Seconds() / (1024 * 1024)
 	}
 	if s.cmdMode() {
 		rep.Mode = "command"
 	} else {
 		rep.Mode = "workload"
 	}
+	rep.Config = s.config
 	for i, m := range s.metricHists() {
 		key := m.name
 		if _, dup := rep.Metrics[key]; dup {
